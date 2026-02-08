@@ -82,7 +82,9 @@ class ListFilesInDirToolHandler(ToolHandler):
 
         api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
 
-        files = api.list_files_in_dir(args["dirpath"])
+        # Sanitize path to avoid double slashes
+        dirpath = args["dirpath"].strip("/")
+        files = api.list_files_in_dir(dirpath)
 
         return [
             TextContent(
@@ -120,10 +122,11 @@ class GetFileContentsToolHandler(ToolHandler):
 
         content = api.get_file_contents(args["filepath"])
 
+        # Return raw text content, not escaped JSON
         return [
             TextContent(
                 type="text",
-                text=json.dumps(content, indent=2)
+                text=content
             )
         ]
     
@@ -523,6 +526,50 @@ class PeriodicNotesToolHandler(ToolHandler):
                 text=content
             )
         ]
+
+class PutPeriodicNoteToolHandler(ToolHandler):
+    def __init__(self):
+        super().__init__("obsidian_put_periodic_note")
+
+    def get_tool_description(self):
+        return Tool(
+            name=self.name,
+            description="Create or update the periodic note for the current period (e.g. today's daily note).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "period": {
+                        "type": "string",
+                        "description": "The period type (daily, weekly, monthly, quarterly, yearly)",
+                        "enum": ["daily", "weekly", "monthly", "quarterly", "yearly"]
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write to the note."
+                    }
+                },
+                "required": ["period", "content"]
+            }
+        )
+
+    def run_tool(self, args: dict) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
+        if "period" not in args or "content" not in args:
+            raise RuntimeError("period and content arguments required")
+
+        period = args["period"]
+        valid_periods = ["daily", "weekly", "monthly", "quarterly", "yearly"]
+        if period not in valid_periods:
+            raise RuntimeError(f"Invalid period: {period}. Must be one of: {', '.join(valid_periods)}")
+
+        api = obsidian.Obsidian(api_key=api_key, host=obsidian_host)
+        api.put_periodic_note(period, args["content"])
+
+        return [
+            TextContent(
+                type="text",
+                text=f"Successfully updated periodic note for {period}"
+            )
+        ]
         
 class RecentPeriodicNotesToolHandler(ToolHandler):
     def __init__(self):
@@ -531,7 +578,7 @@ class RecentPeriodicNotesToolHandler(ToolHandler):
     def get_tool_description(self):
         return Tool(
             name=self.name,
-            description="Get most recent periodic notes for the specified period type.",
+            description="Get most recent periodic notes for the specified period type. Requires Dataview plugin.",
             inputSchema={
                 "type": "object",
                 "properties": {

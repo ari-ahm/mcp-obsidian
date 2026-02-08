@@ -1,7 +1,11 @@
 import requests
 import urllib.parse
 import os
+import urllib3
 from typing import Any
+
+# Suppress insecure request warnings since we are using self-signed certs locally
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class Obsidian():
     def __init__(
@@ -38,9 +42,9 @@ class Obsidian():
             return f()
         except requests.HTTPError as e:
             error_data = e.response.json() if e.response.content else {}
-            code = error_data.get('errorCode', -1) 
-            message = error_data.get('message', '<unknown>')
-            raise Exception(f"Error {code}: {message}")
+            code = error_data.get('errorCode', e.response.status_code) 
+            message = error_data.get('message', str(e))
+            raise Exception(f"Obsidian API Error {code}: {message}")
         except requests.exceptions.RequestException as e:
             raise Exception(f"Request failed: {str(e)}")
 
@@ -50,14 +54,16 @@ class Obsidian():
         def call_fn():
             response = requests.get(url, headers=self._get_headers(), verify=self.verify_ssl, timeout=self.timeout)
             response.raise_for_status()
-            
+
             return response.json()['files']
 
         return self._safe_call(call_fn)
 
         
     def list_files_in_dir(self, dirpath: str) -> Any:
-        url = f"{self.get_base_url()}/vault/{dirpath}/"
+        # FIX: Strip slashes to prevent double-slash errors (e.g. "folder//")
+        clean_path = dirpath.strip("/")
+        url = f"{self.get_base_url()}/vault/{clean_path}/"
         
         def call_fn():
             response = requests.get(url, headers=self._get_headers(), verify=self.verify_ssl, timeout=self.timeout)
@@ -68,12 +74,13 @@ class Obsidian():
         return self._safe_call(call_fn)
 
     def get_file_contents(self, filepath: str) -> Any:
-        url = f"{self.get_base_url()}/vault/{filepath}"
+        # FIX: Ensure clean path
+        clean_path = filepath.strip("/")
+        url = f"{self.get_base_url()}/vault/{clean_path}"
     
         def call_fn():
             response = requests.get(url, headers=self._get_headers(), verify=self.verify_ssl, timeout=self.timeout)
             response.raise_for_status()
-            
             return response.text
 
         return self._safe_call(call_fn)
@@ -114,7 +121,8 @@ class Obsidian():
         return self._safe_call(call_fn)
     
     def append_content(self, filepath: str, content: str) -> Any:
-        url = f"{self.get_base_url()}/vault/{filepath}"
+        clean_path = filepath.strip("/")
+        url = f"{self.get_base_url()}/vault/{clean_path}"
         
         def call_fn():
             response = requests.post(
@@ -130,7 +138,8 @@ class Obsidian():
         return self._safe_call(call_fn)
     
     def patch_content(self, filepath: str, operation: str, target_type: str, target: str, content: str) -> Any:
-        url = f"{self.get_base_url()}/vault/{filepath}"
+        clean_path = filepath.strip("/")
+        url = f"{self.get_base_url()}/vault/{clean_path}"
         
         headers = self._get_headers() | {
             'Content-Type': 'text/markdown',
@@ -147,7 +156,8 @@ class Obsidian():
         return self._safe_call(call_fn)
 
     def put_content(self, filepath: str, content: str) -> Any:
-        url = f"{self.get_base_url()}/vault/{filepath}"
+        clean_path = filepath.strip("/")
+        url = f"{self.get_base_url()}/vault/{clean_path}"
         
         def call_fn():
             response = requests.put(
@@ -171,7 +181,8 @@ class Obsidian():
         Returns:
             None on success
         """
-        url = f"{self.get_base_url()}/vault/{filepath}"
+        clean_path = filepath.strip("/")
+        url = f"{self.get_base_url()}/vault/{clean_path}"
         
         def call_fn():
             response = requests.delete(url, headers=self._get_headers(), verify=self.verify_ssl, timeout=self.timeout)
@@ -213,14 +224,46 @@ class Obsidian():
             if type == "metadata":
                 headers['Accept'] = 'application/vnd.olrapi.note+json'
             response = requests.get(url, headers=headers, verify=self.verify_ssl, timeout=self.timeout)
+            
+            # FIX: Handle 404 gracefully
+            if response.status_code == 404:
+                 return f"Periodic note ({period}) does not exist yet. You can create it using obsidian_put_periodic_note."
+                 
             response.raise_for_status()
             
             return response.text
 
         return self._safe_call(call_fn)
+
+    def put_periodic_note(self, period: str, content: str) -> Any:
+        """Create or update the periodic note for the current period (e.g. today).
+        
+        Args:
+            period: The period type (daily, weekly, monthly, quarterly, yearly)
+            content: The content to write to the note
+            
+        Returns:
+            None on success
+        """
+        url = f"{self.get_base_url()}/periodic/{period}/"
+        
+        def call_fn():
+            response = requests.put(
+                url, 
+                headers=self._get_headers() | {'Content-Type': 'text/markdown'}, 
+                data=content,
+                verify=self.verify_ssl, 
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+            return None
+
+        return self._safe_call(call_fn)
     
     def get_recent_periodic_notes(self, period: str, limit: int = 5, include_content: bool = False) -> Any:
         """Get most recent periodic notes for the specified period type.
+        
+        Note: This implementation uses Dataview DQL to find files with a valid date.
         
         Args:
             period: The period type (daily, weekly, monthly, quarterly, yearly)
@@ -230,23 +273,54 @@ class Obsidian():
         Returns:
             List of recent periodic notes
         """
-        url = f"{self.get_base_url()}/periodic/{period}/recent"
-        params = {
-            "limit": limit,
-            "includeContent": include_content
+        # Since /periodic/{period}/recent does not exist in the standard API,
+        # we act as a proxy using Dataview DQL to find files that look like periodic notes (have a day property).
+        # We cannot strictly distinguish 'daily' from 'weekly' without folder config, 
+        # but 'WHERE file.day' is the standard way to find periodic notes.
+        
+        dql_query = f"""
+        TABLE WITHOUT ID file.path as "filepath", file.day as "date"
+        WHERE file.day
+        SORT file.day DESC
+        LIMIT {limit}
+        """
+
+        url = f"{self.get_base_url()}/search/"
+        headers = self._get_headers() | {
+            'Content-Type': 'application/vnd.olrapi.dataview.dql+txt'
         }
         
         def call_fn():
-            response = requests.get(
+            # 1. Search for files
+            response = requests.post(
                 url, 
-                headers=self._get_headers(), 
-                params=params,
+                headers=headers, 
+                data=dql_query.encode('utf-8'),
                 verify=self.verify_ssl, 
                 timeout=self.timeout
             )
             response.raise_for_status()
+            results = response.json()
             
-            return response.json()
+            # 2. Format results
+            formatted_results = []
+            for item in results:
+                note_info = {
+                    "filepath": item.get("filepath", "Unknown"),
+                    "date": item.get("date", "Unknown")
+                }
+                
+                # 3. Fetch content if requested (N+1 query, but necessary if content is needed)
+                if include_content:
+                    try:
+                        content = self.get_file_contents(note_info["filepath"])
+                        note_info["content"] = content
+                    except Exception:
+                        note_info["content"] = "<Error fetching content>"
+                
+                formatted_results.append(note_info)
+                
+            return formatted_results
 
         return self._safe_call(call_fn)
     
