@@ -273,13 +273,10 @@ class Obsidian():
         Returns:
             List of recent periodic notes
         """
-        # Since /periodic/{period}/recent does not exist in the standard API,
-        # we act as a proxy using Dataview DQL to find files that look like periodic notes (have a day property).
-        # We cannot strictly distinguish 'daily' from 'weekly' without folder config, 
-        # but 'WHERE file.day' is the standard way to find periodic notes.
-        
+        # We must use standard TABLE queries, not WITHOUT ID, as the API forbids it.
+        # file.day is a built-in Dataview field for periodic notes.
         dql_query = f"""
-        TABLE WITHOUT ID file.path as "filepath", file.day as "date"
+        TABLE file.day as "date"
         WHERE file.day
         SORT file.day DESC
         LIMIT {limit}
@@ -305,15 +302,22 @@ class Obsidian():
             # 2. Format results
             formatted_results = []
             for item in results:
+                # The API returns dicts with 'filename' (implicit ID) and 'result' (columns)
+                filepath = item.get("filename", "Unknown")
+                
+                # 'result' contains the requested columns
+                result_data = item.get("result", {})
+                date = result_data.get("date", "Unknown") if isinstance(result_data, dict) else "Unknown"
+
                 note_info = {
-                    "filepath": item.get("filepath", "Unknown"),
-                    "date": item.get("date", "Unknown")
+                    "filepath": filepath,
+                    "date": date
                 }
                 
-                # 3. Fetch content if requested (N+1 query, but necessary if content is needed)
+                # 3. Fetch content if requested
                 if include_content:
                     try:
-                        content = self.get_file_contents(note_info["filepath"])
+                        content = self.get_file_contents(filepath)
                         note_info["content"] = content
                     except Exception:
                         note_info["content"] = "<Error fetching content>"
